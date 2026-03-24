@@ -126,6 +126,14 @@ static char *sysfs_find_group_file(const char *device, Error **errp)
     }
 
     path = g_strdup_printf("/dev/vfio/%s", p + 1);
+    if (access(path, F_OK) != 0 && errno == ENOENT) {
+        g_free(path);
+        path = g_strdup_printf("/dev/vfio/noiommu-%s", p + 1);
+        warn_report("vfio: group %s not found at /dev/vfio/%s, "
+                    "falling back to no-IOMMU path %s. "
+                    "This is an unsafe configuration.",
+                    p + 1, p + 1, path);
+    }
 out:
     g_free(sysfs_link);
     g_free(sysfs_group);

@@ -49,6 +49,7 @@ static int vfio_ram_block_discard_disable(VFIOContainer *container, bool state)
     switch (container->iommu_type) {
     case VFIO_TYPE1v2_IOMMU:
     case VFIO_TYPE1_IOMMU:
+    case VFIO_NOIOMMU_IOMMU:
         /*
          * We support coordinated discarding of RAM via the RamDiscardManager.
          */
@@ -126,6 +127,12 @@ static int vfio_legacy_dma_unmap_one(const VFIOContainerBase *bcontainer,
 {
     const VFIOContainer *container = container_of(bcontainer, VFIOContainer,
                                                   bcontainer);
+
+    /* No-IOMMU containers have no DMA mappings to unmap. */
+    if (container->iommu_type == VFIO_NOIOMMU_IOMMU) {
+        return 0;
+    }
+
     struct vfio_iommu_type1_dma_unmap unmap = {
         .argsz = sizeof(unmap),
         .flags = 0,
@@ -215,6 +222,12 @@ static int vfio_legacy_dma_map(const VFIOContainerBase *bcontainer, hwaddr iova,
 {
     const VFIOContainer *container = container_of(bcontainer, VFIOContainer,
                                                   bcontainer);
+
+    /* No-IOMMU containers require no DMA mapping; the device has full access. */
+    if (container->iommu_type == VFIO_NOIOMMU_IOMMU) {
+        return 0;
+    }
+
     struct vfio_iommu_type1_dma_map map = {
         .argsz = sizeof(map),
         .flags = VFIO_DMA_MAP_FLAG_READ,
@@ -360,7 +373,8 @@ static int vfio_get_iommu_type(int container_fd,
                                Error **errp)
 {
     int iommu_types[] = { VFIO_TYPE1v2_IOMMU, VFIO_TYPE1_IOMMU,
-                          VFIO_SPAPR_TCE_v2_IOMMU, VFIO_SPAPR_TCE_IOMMU };
+                          VFIO_SPAPR_TCE_v2_IOMMU, VFIO_SPAPR_TCE_IOMMU,
+                          VFIO_NOIOMMU_IOMMU };
     int i;
 
     for (i = 0; i < ARRAY_SIZE(iommu_types); i++) {
@@ -386,6 +400,9 @@ static const char *vfio_get_iommu_class_name(int iommu_type)
     case VFIO_SPAPR_TCE_IOMMU:
         return TYPE_VFIO_IOMMU_SPAPR;
         break;
+    case VFIO_NOIOMMU_IOMMU:
+        return TYPE_VFIO_IOMMU_LEGACY;
+        break;
     default:
         g_assert_not_reached();
     };
@@ -397,6 +414,10 @@ static bool vfio_set_iommu(int container_fd, int group_fd,
     if (ioctl(group_fd, VFIO_GROUP_SET_CONTAINER, &container_fd)) {
         error_setg_errno(errp, errno, "Failed to set group container");
         return false;
+    }
+
+    if (*iommu_type == VFIO_NOIOMMU_IOMMU) {
+        return true;
     }
 
     while (ioctl(container_fd, VFIO_SET_IOMMU, *iommu_type)) {
@@ -522,6 +543,15 @@ static bool vfio_legacy_setup(VFIOContainerBase *bcontainer, Error **errp)
                                             bcontainer);
     g_autofree struct vfio_iommu_type1_info *info = NULL;
     int ret;
+
+    /*
+     * The kernel no-IOMMU backend does not implement VFIO_IOMMU_GET_INFO or
+     * DMA mapping ioctls.  Set minimal defaults and skip the rest of setup.
+     */
+    if (container->iommu_type == VFIO_NOIOMMU_IOMMU) {
+        bcontainer->pgsizes = qemu_real_host_page_size();
+        return true;
+    }
 
     ret = vfio_get_iommu_info(container, &info);
     if (ret) {
@@ -775,7 +805,7 @@ static VFIOGroup *vfio_group_get(int groupid, AddressSpace *as, Error **errp)
 {
     ERRP_GUARD();
     VFIOGroup *group;
-    char path[32];
+    char path[64];
     struct vfio_group_status status = { .argsz = sizeof(status) };
 
     QLIST_FOREACH(group, &vfio_group_list, next) {
@@ -794,6 +824,13 @@ static VFIOGroup *vfio_group_get(int groupid, AddressSpace *as, Error **errp)
     group = g_malloc0(sizeof(*group));
 
     snprintf(path, sizeof(path), "/dev/vfio/%d", groupid);
+    if (access(path, F_OK) != 0 && errno == ENOENT) {
+        snprintf(path, sizeof(path), "/dev/vfio/noiommu-%d", groupid);
+        warn_report("vfio: group %d not found at /dev/vfio/%d, "
+                    "falling back to no-IOMMU path %s. "
+                    "This is an unsafe configuration.",
+                    groupid, groupid, path);
+    }
     group->fd = cpr_open_fd(path, O_RDWR, "vfio_group", groupid, errp);
     if (group->fd < 0) {
         goto free_group_exit;
