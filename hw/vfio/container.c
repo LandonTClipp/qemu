@@ -416,6 +416,10 @@ static bool vfio_set_iommu(int container_fd, int group_fd,
         return false;
     }
 
+    if (*iommu_type == VFIO_NOIOMMU_IOMMU) {
+        return true;
+    }
+
     while (ioctl(container_fd, VFIO_SET_IOMMU, *iommu_type)) {
         if (*iommu_type == VFIO_SPAPR_TCE_v2_IOMMU) {
             /*
